@@ -964,6 +964,13 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self._set_cors_headers()
 
+    def _send_response_event(self, event_type: str, data: dict, sequence: int) -> int:
+        event = {"type": event_type, "sequence_number": sequence, **data}
+        self.wfile.write(f"event: {event_type}\n".encode())
+        self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+        self.wfile.flush()
+        return sequence + 1
+
     def do_OPTIONS(self):
         self._set_completion_headers(204)
         self.end_headers()
@@ -1345,11 +1352,9 @@ class APIHandler(BaseHTTPRequestHandler):
 
         def send_response_event(event_type: str, data: dict):
             nonlocal response_sequence
-            event = {"type": event_type, "sequence_number": response_sequence, **data}
-            response_sequence += 1
-            self.wfile.write(f"event: {event_type}\n".encode())
-            self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
-            self.wfile.flush()
+            response_sequence = self._send_response_event(
+                event_type, data, response_sequence
+            )
 
         def finish_reasoning_item(summary_text: str) -> None:
             nonlocal reasoning_done
@@ -1798,15 +1803,9 @@ class APIHandler(BaseHTTPRequestHandler):
 
             def send_response_event(event_type: str, data: dict):
                 nonlocal response_sequence
-                event = {
-                    "type": event_type,
-                    "sequence_number": response_sequence,
-                    **data,
-                }
-                response_sequence += 1
-                self.wfile.write(f"event: {event_type}\n".encode())
-                self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
-                self.wfile.flush()
+                response_sequence = self._send_response_event(
+                    event_type, data, response_sequence
+                )
 
             response_obj = {
                 "id": response_id,

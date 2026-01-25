@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 import uuid
 from typing import Any
@@ -26,6 +27,8 @@ except ImportError:  # pragma: no cover - optional dependency
 
 
 HARMONY_KEYWORDS = ["gpt-oss", "harmony"]
+
+logger = logging.getLogger(__name__)
 
 
 def is_harmony_model(model_name: str) -> bool:
@@ -140,7 +143,11 @@ def parse_harmony_output(content: str) -> dict[str, Any]:
         result["reasoning"] = "\n".join(reasoning_parts) if reasoning_parts else None
         result["final_text"] = "\n".join(final_parts) if final_parts else ""
 
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "Harmony parsing failed; falling back to regex.",
+            exc_info=exc,
+        )
         result = _parse_harmony_regex_fallback(content)
 
     return result

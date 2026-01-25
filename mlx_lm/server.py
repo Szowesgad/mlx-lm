@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
 from queue import Queue
-from threading import Condition, Thread
+from threading import Condition, Lock, Thread
 from typing import (
     Any,
     Callable,
@@ -389,6 +389,52 @@ class GenerationContext:
 
     def stop(self):
         self._should_stop = True
+
+
+@dataclass
+class InflightResponse:
+    ctx: Optional["GenerationContext"]
+    model: str
+    created_at: int
+    cancelled: bool = False
+
+
+_INFLIGHT_RESPONSES: Dict[str, InflightResponse] = {}
+_INFLIGHT_RESPONSES_LOCK = Lock()
+
+
+def register_inflight_response(
+    response_id: str, ctx: Optional["GenerationContext"], model: str, created_at: int
+) -> None:
+    with _INFLIGHT_RESPONSES_LOCK:
+        _INFLIGHT_RESPONSES[response_id] = InflightResponse(
+            ctx=ctx,
+            model=model,
+            created_at=created_at,
+        )
+
+
+def get_inflight_response(response_id: str) -> Optional[InflightResponse]:
+    with _INFLIGHT_RESPONSES_LOCK:
+        return _INFLIGHT_RESPONSES.get(response_id)
+
+
+def mark_inflight_response_cancelled(response_id: str) -> Optional[InflightResponse]:
+    ctx = None
+    with _INFLIGHT_RESPONSES_LOCK:
+        inflight = _INFLIGHT_RESPONSES.get(response_id)
+        if inflight is None:
+            return None
+        inflight.cancelled = True
+        ctx = inflight.ctx
+    if ctx is not None:
+        ctx.stop()
+    return inflight
+
+
+def pop_inflight_response(response_id: str) -> Optional[InflightResponse]:
+    with _INFLIGHT_RESPONSES_LOCK:
+        return _INFLIGHT_RESPONSES.pop(response_id, None)
 
 
 @dataclass
@@ -1279,6 +1325,12 @@ class APIHandler(BaseHTTPRequestHandler):
             logging.debug("Starting completion:")
 
         is_response = self.object_type == "response"
+        inflight = None
+        if is_response:
+            register_inflight_response(
+                self.request_id, ctx, self.requested_model, self.created
+            )
+            inflight = get_inflight_response(self.request_id)
         is_harmony = is_response and is_harmony_model(self.requested_model)
         harmony_parser = HarmonyStreamingParser() if is_harmony else None
         harmony_output_parts: List[str] = []
@@ -1298,6 +1350,78 @@ class APIHandler(BaseHTTPRequestHandler):
             self.wfile.write(f"event: {event_type}\n".encode())
             self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
             self.wfile.flush()
+
+        def finish_reasoning_item(summary_text: str) -> None:
+            nonlocal reasoning_done
+            if not (self.stream and is_response):
+                return
+            if reasoning_item_emitted and not reasoning_done:
+                send_response_event(
+                    "response.reasoning_summary_text.done",
+                    {
+                        "item_id": reasoning_item_id,
+                        "output_index": 0,
+                        "text": summary_text,
+                    },
+                )
+                send_response_event(
+                    "response.output_item.done",
+                    {
+                        "output_index": 0,
+                        "item": {
+                            "id": reasoning_item_id,
+                            "type": "reasoning",
+                            "summary": [{"type": "summary_text", "text": summary_text}],
+                        },
+                    },
+                )
+                reasoning_done = True
+
+        def ensure_message_item() -> int:
+            nonlocal message_item_emitted, message_output_index
+            if not (self.stream and is_response):
+                return 0
+            if not message_item_emitted:
+                message_output_index = 1 if reasoning_item_emitted else 0
+                send_response_event(
+                    "response.output_item.added",
+                    {
+                        "output_index": message_output_index,
+                        "item": {
+                            "id": message_item_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "in_progress",
+                            "content": [],
+                        },
+                    },
+                )
+                send_response_event(
+                    "response.content_part.added",
+                    {
+                        "output_index": message_output_index,
+                        "content_index": 0,
+                        "part": {"type": "output_text", "text": ""},
+                    },
+                )
+                message_item_emitted = True
+            return message_output_index
+
+        def emit_response_text_delta(delta_text: str, summary_text: str) -> None:
+            if not (self.stream and is_response):
+                return
+            if not delta_text:
+                return
+            finish_reasoning_item(summary_text)
+            output_index = ensure_message_item()
+            send_response_event(
+                "response.output_text.delta",
+                {
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "delta": delta_text,
+                },
+            )
 
         if self.stream and is_response:
             message_item_id = f"msg_{uuid.uuid4().hex}"
@@ -1404,104 +1528,15 @@ class APIHandler(BaseHTTPRequestHandler):
                 elif event_type == "output" and clean_text:
                     harmony_output_parts.append(clean_text)
                     if self.stream and is_response:
-                        if reasoning_item_emitted and not reasoning_done:
-                            send_response_event(
-                                "response.reasoning_summary_text.done",
-                                {
-                                    "item_id": reasoning_item_id,
-                                    "output_index": 0,
-                                    "text": "".join(harmony_reasoning_parts),
-                                },
-                            )
-                            send_response_event(
-                                "response.output_item.done",
-                                {
-                                    "output_index": 0,
-                                    "item": {
-                                        "id": reasoning_item_id,
-                                        "type": "reasoning",
-                                        "summary": [
-                                            {
-                                                "type": "summary_text",
-                                                "text": "".join(
-                                                    harmony_reasoning_parts
-                                                ),
-                                            }
-                                        ],
-                                    },
-                                },
-                            )
-                            reasoning_done = True
-
-                        if not message_item_emitted:
-                            message_output_index = 1 if reasoning_item_emitted else 0
-                            send_response_event(
-                                "response.output_item.added",
-                                {
-                                    "output_index": message_output_index,
-                                    "item": {
-                                        "id": message_item_id,
-                                        "type": "message",
-                                        "role": "assistant",
-                                        "status": "in_progress",
-                                        "content": [],
-                                    },
-                                },
-                            )
-                            send_response_event(
-                                "response.content_part.added",
-                                {
-                                    "output_index": message_output_index,
-                                    "content_index": 0,
-                                    "part": {"type": "output_text", "text": ""},
-                                },
-                            )
-                            message_item_emitted = True
-
-                        send_response_event(
-                            "response.output_text.delta",
-                            {
-                                "output_index": message_output_index,
-                                "content_index": 0,
-                                "delta": clean_text,
-                            },
+                        emit_response_text_delta(
+                            clean_text, "".join(harmony_reasoning_parts)
                         )
 
             # Non-Harmony models
             elif in_reasoning:
                 if gen.text == ctx.think_end:
                     in_reasoning = False
-                    if (
-                        self.stream
-                        and is_response
-                        and reasoning_item_emitted
-                        and not reasoning_done
-                    ):
-                        send_response_event(
-                            "response.reasoning_summary_text.done",
-                            {
-                                "item_id": reasoning_item_id,
-                                "output_index": 0,
-                                "text": reasoning_text,
-                            },
-                        )
-                        send_response_event(
-                            "response.output_item.done",
-                            {
-                                "output_index": 0,
-                                "item": {
-                                    "id": reasoning_item_id,
-                                    "type": "reasoning",
-                                    "summary": [
-                                        {
-                                            "type": "summary_text",
-                                            "text": reasoning_text,
-                                        }
-                                    ],
-                                },
-                            },
-                        )
-                        reasoning_done = True
+                    finish_reasoning_item(reasoning_text)
                 else:
                     reasoning_text += gen.text
                     if self.stream and is_response:
@@ -1577,66 +1612,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     continue
                 elif is_response:
                     if segment:
-                        if reasoning_item_emitted and not reasoning_done:
-                            send_response_event(
-                                "response.reasoning_summary_text.done",
-                                {
-                                    "item_id": reasoning_item_id,
-                                    "output_index": 0,
-                                    "text": reasoning_text,
-                                },
-                            )
-                            send_response_event(
-                                "response.output_item.done",
-                                {
-                                    "output_index": 0,
-                                    "item": {
-                                        "id": reasoning_item_id,
-                                        "type": "reasoning",
-                                        "summary": [
-                                            {
-                                                "type": "summary_text",
-                                                "text": reasoning_text,
-                                            }
-                                        ],
-                                    },
-                                },
-                            )
-                            reasoning_done = True
-
-                        if not message_item_emitted:
-                            message_output_index = 1 if reasoning_item_emitted else 0
-                            send_response_event(
-                                "response.output_item.added",
-                                {
-                                    "output_index": message_output_index,
-                                    "item": {
-                                        "id": message_item_id,
-                                        "type": "message",
-                                        "role": "assistant",
-                                        "status": "in_progress",
-                                        "content": [],
-                                    },
-                                },
-                            )
-                            send_response_event(
-                                "response.content_part.added",
-                                {
-                                    "output_index": message_output_index,
-                                    "content_index": 0,
-                                    "part": {"type": "output_text", "text": ""},
-                                },
-                            )
-                            message_item_emitted = True
-
-                        send_response_event(
-                            "response.output_text.delta",
-                            {
-                                "output_index": message_output_index,
-                                "content_index": 0,
-                                "delta": segment,
-                            },
-                        )
+                        emit_response_text_delta(segment, reasoning_text)
                         segment = ""
                 elif segment or tool_calls or reasoning_text:
                     response = self.generate_response(
@@ -1682,60 +1658,17 @@ class APIHandler(BaseHTTPRequestHandler):
                     for tool_call in parsed["tool_calls"]
                 ]
 
+        cancelled = inflight is not None and inflight.cancelled
+
         if self.stream and is_response:
             final_tool_calls = (
                 harmony_tool_calls
                 if harmony_tool_calls is not None
                 else parse_tools(tool_calls)
             )
-            if reasoning_item_emitted and not reasoning_done:
-                send_response_event(
-                    "response.reasoning_summary_text.done",
-                    {
-                        "item_id": reasoning_item_id,
-                        "output_index": 0,
-                        "text": reasoning_text,
-                    },
-                )
-                send_response_event(
-                    "response.output_item.done",
-                    {
-                        "output_index": 0,
-                        "item": {
-                            "id": reasoning_item_id,
-                            "type": "reasoning",
-                            "summary": [
-                                {"type": "summary_text", "text": reasoning_text}
-                            ],
-                        },
-                    },
-                )
-                reasoning_done = True
-
-            if not message_item_emitted:
-                message_output_index = 1 if reasoning_item_emitted else 0
-                send_response_event(
-                    "response.output_item.added",
-                    {
-                        "output_index": message_output_index,
-                        "item": {
-                            "id": message_item_id,
-                            "type": "message",
-                            "role": "assistant",
-                            "status": "in_progress",
-                            "content": [],
-                        },
-                    },
-                )
-                send_response_event(
-                    "response.content_part.added",
-                    {
-                        "output_index": message_output_index,
-                        "content_index": 0,
-                        "part": {"type": "output_text", "text": ""},
-                    },
-                )
-                message_item_emitted = True
+            finish_reasoning_item(reasoning_text)
+            message_output_index = ensure_message_item()
+            message_status = "cancelled" if cancelled else "completed"
 
             send_response_event(
                 "response.output_text.done",
@@ -1761,18 +1694,19 @@ class APIHandler(BaseHTTPRequestHandler):
                         "id": message_item_id,
                         "type": "message",
                         "role": "assistant",
-                        "status": "completed",
+                        "status": message_status,
                         "content": [{"type": "output_text", "text": text}],
                     },
                 },
             )
 
+            response_status = "cancelled" if cancelled else "completed"
             response_payload = {
                 "id": self.request_id,
                 "object": "response",
                 "created_at": self.created,
                 "model": self.requested_model,
-                "status": "completed",
+                "status": response_status,
                 "output": build_response_output_items(
                     text,
                     reasoning_text=reasoning_text,
@@ -1784,7 +1718,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     "total_tokens": len(ctx.prompt) + len(tokens),
                 },
             }
-            send_response_event("response.completed", {"response": response_payload})
+            final_event = "response.cancelled" if cancelled else "response.completed"
+            send_response_event(final_event, {"response": response_payload})
 
             if self.responses_store and self.responses_request is not None:
                 store_response(
@@ -1793,6 +1728,8 @@ class APIHandler(BaseHTTPRequestHandler):
 
             self.wfile.write("data: [DONE]\n\n".encode())
             self.wfile.flush()
+            if is_response:
+                pop_inflight_response(self.request_id)
             return
 
         if self.stream:
@@ -1827,6 +1764,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 reasoning_text=reasoning_text,
                 tool_calls=final_tool_calls,
             )
+            if is_response and cancelled:
+                response["status"] = "cancelled"
             if (
                 is_response
                 and self.responses_store
@@ -1842,10 +1781,14 @@ class APIHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(response_json)
             self.wfile.flush()
+            if is_response:
+                pop_inflight_response(self.request_id)
 
     def handle_responses_vision(self, normalized: dict[str, Any]) -> None:
         response_id = self.request_id or f"resp_{uuid.uuid4().hex}"
         message_item_id = f"msg_{uuid.uuid4().hex}"
+        register_inflight_response(response_id, None, self.requested_model, self.created)
+        inflight = get_inflight_response(response_id)
 
         if self.stream:
             self._set_stream_headers(200)
@@ -1885,6 +1828,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 for delta in responses_vision.stream_generate(
                     self.requested_model, normalized
                 ):
+                    if inflight is not None and inflight.cancelled:
+                        break
                     if not delta:
                         continue
 
@@ -1923,6 +1868,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     )
 
                 final_text = "".join(output_text_parts)
+                cancelled = inflight is not None and inflight.cancelled
+                message_status = "cancelled" if cancelled else "completed"
 
                 if not message_item_emitted:
                     send_response_event(
@@ -1971,23 +1918,25 @@ class APIHandler(BaseHTTPRequestHandler):
                             "id": message_item_id,
                             "type": "message",
                             "role": "assistant",
-                            "status": "completed",
+                            "status": message_status,
                             "content": [{"type": "output_text", "text": final_text}],
                         },
                     },
                 )
 
+                response_status = "cancelled" if cancelled else "completed"
                 response_payload = {
                     "id": response_id,
                     "object": "response",
                     "created_at": self.created,
                     "model": self.requested_model,
-                    "status": "completed",
+                    "status": response_status,
                     "output": build_response_output_items(final_text),
                 }
-                send_response_event(
-                    "response.completed", {"response": response_payload}
+                final_event = (
+                    "response.cancelled" if cancelled else "response.completed"
                 )
+                send_response_event(final_event, {"response": response_payload})
 
                 if self.responses_store and self.responses_request is not None:
                     store_response(
@@ -1996,6 +1945,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 self.wfile.write("data: [DONE]\n\n".encode())
                 self.wfile.flush()
+                pop_inflight_response(response_id)
                 return
 
             except Exception as exc:
@@ -2011,20 +1961,23 @@ class APIHandler(BaseHTTPRequestHandler):
                 )
                 self.wfile.write("data: [DONE]\n\n".encode())
                 self.wfile.flush()
+                pop_inflight_response(response_id)
                 return
 
         try:
             text, usage = responses_vision.generate(self.requested_model, normalized)
         except Exception as exc:
             self._responses_error(500, str(exc), "internal_error", error_type="error")
+            pop_inflight_response(response_id)
             return
 
+        cancelled = inflight is not None and inflight.cancelled
         response_payload = {
             "id": response_id,
             "object": "response",
             "created_at": self.created,
             "model": self.requested_model,
-            "status": "completed",
+            "status": "cancelled" if cancelled else "completed",
             "output": build_response_output_items(text),
             "usage": usage,
         }
@@ -2038,6 +1991,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(response_json)
         self.wfile.flush()
+        pop_inflight_response(response_id)
 
     def completion_usage_response(
         self,
@@ -2228,6 +2182,22 @@ class APIHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def handle_response_cancel(self, response_id: str):
+        inflight = mark_inflight_response_cancelled(response_id)
+        if inflight is not None:
+            response_payload = {
+                "id": response_id,
+                "object": "response",
+                "created_at": inflight.created_at,
+                "model": inflight.model,
+                "status": "cancelled",
+                "output": [],
+            }
+            self._set_completion_headers(200)
+            self.end_headers()
+            self.wfile.write(json.dumps(response_payload).encode())
+            self.wfile.flush()
+            return
+
         stored = get_stored_response(response_id)
         if stored is None:
             self._responses_error(
@@ -2237,18 +2207,18 @@ class APIHandler(BaseHTTPRequestHandler):
             )
             return
 
-        if stored.status != "in_progress":
-            self._responses_error(
-                400,
-                f"Response '{response_id}' is not in progress (status: {stored.status})",
-                "response_not_cancellable",
-            )
+        if stored.status == "cancelled":
+            self._set_completion_headers(200)
+            self.end_headers()
+            self.wfile.write(json.dumps(stored.response).encode())
+            self.wfile.flush()
             return
 
-        self._set_completion_headers(200)
-        self.end_headers()
-        self.wfile.write(json.dumps(stored.response).encode())
-        self.wfile.flush()
+        self._responses_error(
+            400,
+            f"Response '{response_id}' is not in progress (status: {stored.status})",
+            "response_not_cancellable",
+        )
 
     def handle_response_input_items(self, response_id: str):
         stored = get_stored_response(response_id)

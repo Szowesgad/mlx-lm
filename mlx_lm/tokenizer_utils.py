@@ -1,11 +1,14 @@
 import importlib
 import json
+import logging
 import warnings
 from functools import partial
 from json import JSONDecodeError
 from typing import Any, Dict, List, Optional
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
+
+logger = logging.getLogger(__name__)
 
 
 class StreamingDetokenizer:
@@ -210,7 +213,11 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
             if bos_token and decoded.startswith(bos_token):
                 decoded = decoded[len(bos_token) :]
             return decoded == "a,b"
-        except Exception:
+        except Exception as exc:
+            logger.debug(
+                "BPE trim inference failed; falling back to default spacing.",
+                exc_info=exc,
+            )
             return False
 
     def add_token(self, token):

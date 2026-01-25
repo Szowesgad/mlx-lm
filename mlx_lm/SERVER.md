@@ -135,7 +135,7 @@ curl localhost:8080/v1/chat/completions \
 The responses API follows the [OpenAI responses API
 spec](https://platform.openai.com/docs/quickstart?api-mode=responses)
 
-To make a request, use the `/reponses` endpoint. For exapmle:
+To make a request, use the `/responses` endpoint. For example:
 
 ```shell
 curl localhost:8080/responses \
@@ -145,6 +145,17 @@ curl localhost:8080/responses \
      "temperature": 0.7
    }'
 ```
+
+The server also supports retrieving and deleting stored responses:
+
+```shell
+curl localhost:8080/v1/responses/resp_123
+curl -X DELETE localhost:8080/v1/responses/resp_123
+```
+
+Note: image inputs can be routed through `mlx-vlm` when it is installed; audio
+and video inputs are accepted but treated as text placeholders in the local
+text-only server.
 
 ## Models API
 

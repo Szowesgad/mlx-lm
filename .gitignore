@@ -137,6 +137,6 @@ dmypy.json
 
 # .DS_Store files
 .DS_Store
-/.claude/**
-.loctree/**
-/AI-academy/**
+/AI-academy
+/.loctree
+/.claude

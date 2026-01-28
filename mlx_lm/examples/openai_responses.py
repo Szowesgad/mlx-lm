@@ -1,4 +1,4 @@
-# Copyright © 2025 Apple Inc.
+# Copyright © 2026 Apple Inc.
 """
 Examples using the OpenAI responses endpoint with mlx_lm.server.
 
